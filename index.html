@@ -1,0 +1,657 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <title>Optimized FO-Transformed Goldwasser-Micali KEM</title>
+  <style>
+    body {
+      font-family: monospace;
+      padding: 20px;
+      background: #1e1e1e;
+      color: #d4d4d4;
+      max-width: 950px;
+      margin: auto;
+    }
+    h2 { color: #569cd6; margin-bottom: 5px; }
+    p.subtitle { color: #858585; margin-top: 0; }
+    .box {
+      background: #252526;
+      border: 1px solid #454545;
+      padding: 15px;
+      margin-bottom: 15px;
+      border-radius: 4px;
+    }
+    .label { color: #ce9178; font-weight: bold; margin-bottom: 5px; }
+    .value { word-break: break-all; color: #b5cea8; font-size: 12px; }
+    .success { color: #4ec9b0; font-weight: bold; }
+    .error { color: #f14c4c; font-weight: bold; }
+    button {
+      background: #0e639c;
+      color: white;
+      border: none;
+      padding: 10px 15px;
+      font-size: 14px;
+      cursor: pointer;
+      border-radius: 2px;
+      margin-right: 10px;
+    }
+    button:hover { background: #1177bb; }
+    #log {
+      white-space: pre-wrap;
+      background: #121212;
+      padding: 10px;
+      border: 1px solid #333;
+      color: #4ec9b0;
+      margin-top: 15px;
+      min-height: 42px;
+    }
+  </style>
+</head>
+<body>
+
+  <h2>Optimized FO-Transformed Goldwasser-Micali KEM</h2>
+  <p class="subtitle">
+    2048-bit GM modulus · 256-bit seed · bulk AES-CTR coin derivation · constant-time FO check
+  </p>
+
+  <button onclick="runKemDemo(false)">Run Honest Exchange</button>
+  <button onclick="runKemDemo(true)">Run Tampered CCA Exchange</button>
+
+  <div id="output" style="margin-top: 20px;"></div>
+  <div id="log">Status: Idle.</div>
+
+  <script>
+    // ============================================================
+    // CONFIGURATION
+    // ============================================================
+
+    // 1024-bit primes => 2048-bit modulus N.
+    // This is the minimum practical classical RSA-style security level.
+    // For ~128-bit NIST-equivalent RSA security, use 1536-bit primes,
+    // but it will be noticeably slower.
+    const PRIME_BITS = 1024;
+
+    // 40 rounds is a practical conservative choice for 1024-bit primes.
+    // 64 is more conservative but slower.
+    const MR_ROUNDS = 40;
+
+    // 256-bit shared seed => enough for AES-256.
+    // If you only need 128-bit security, setting this to 16 halves the work.
+    const SEED_BYTES = 32;
+
+    const enc = new TextEncoder();
+    let paramsPromise = null;
+    let busy = false;
+
+    function logStatus(msg) {
+      document.getElementById("log").innerText = "Status: " + msg;
+    }
+
+    function tick() {
+      return new Promise(resolve => setTimeout(resolve, 0));
+    }
+
+    // ============================================================
+    // BIGINT UTILITIES
+    // ============================================================
+
+    function modPow(base, exp, mod) {
+      let res = 1n;
+      base = base % mod;
+
+      while (exp > 0n) {
+        if (exp & 1n) {
+          res = (res * base) % mod;
+        }
+        base = (base * base) % mod;
+        exp >>= 1n;
+      }
+
+      return res;
+    }
+
+    function gcd(a, b) {
+      while (b !== 0n) {
+        const t = a % b;
+        a = b;
+        b = t;
+      }
+      return a;
+    }
+
+    function cryptoRandomBigInt(bits) {
+      const bytes = new Uint8Array(Math.ceil(bits / 8));
+      crypto.getRandomValues(bytes);
+
+      let value = 0n;
+      for (const byte of bytes) {
+        value = (value << 8n) | BigInt(byte);
+      }
+
+      return value;
+    }
+
+    function bytesToBigIntBE(bytes, start, length) {
+      let value = 0n;
+      const end = start + length;
+
+      for (let i = start; i < end; i++) {
+        value = (value << 8n) | BigInt(bytes[i]);
+      }
+
+      return value;
+    }
+
+    function bytesToHex(bytes) {
+      return Array.from(bytes)
+        .map(b => b.toString(16).padStart(2, "0"))
+        .join("");
+    }
+
+    // ============================================================
+    // PRIME GENERATION
+    // ============================================================
+
+    const SMALL_PRIMES = [
+      3n, 5n, 7n, 11n, 13n, 17n, 19n, 23n, 29n, 31n,
+      37n, 41n, 43n, 47n, 53n, 59n, 61n, 67n, 71n,
+      73n, 79n, 83n, 89n, 97n, 101n, 103n, 107n,
+      109n, 113n, 127n, 131n, 137n, 139n, 149n
+    ];
+
+    function isPrime(n, rounds = MR_ROUNDS) {
+      if (n < 2n) return false;
+      if ((n & 1n) === 0n) return n === 2n;
+
+      for (const p of SMALL_PRIMES) {
+        if (n === p) return true;
+        if (n % p === 0n) return false;
+      }
+
+      let d = n - 1n;
+      let s = 0n;
+
+      while ((d & 1n) === 0n) {
+        d >>= 1n;
+        s++;
+      }
+
+      const nBits = n.toString(2).length;
+
+      for (let i = 0; i < rounds; i++) {
+        const a = 2n + (cryptoRandomBigInt(nBits) % (n - 4n));
+        let x = modPow(a, d, n);
+
+        if (x === 1n || x === n - 1n) {
+          continue;
+        }
+
+        let composite = true;
+
+        for (let j = 1n; j < s; j++) {
+          x = (x * x) % n;
+
+          if (x === n - 1n) {
+            composite = false;
+            break;
+          }
+
+          if (x === 1n) {
+            break;
+          }
+        }
+
+        if (composite) {
+          return false;
+        }
+      }
+
+      return true;
+    }
+
+    function getLargePrime(bits) {
+      while (true) {
+        let p = cryptoRandomBigInt(bits);
+
+        // Force exact bit length.
+        p |= (1n << BigInt(bits - 1));
+
+        // Force Blum prime: p = 3 mod 4.
+        p |= 3n;
+
+        if (isPrime(p)) {
+          return p;
+        }
+      }
+    }
+
+    function findQNR(p, q, N) {
+      const bits = N.toString(2).length;
+
+      while (true) {
+        const x = 2n + (cryptoRandomBigInt(bits) % (N - 4n));
+
+        if (gcd(x, N) !== 1n) {
+          continue;
+        }
+
+        const legP = modPow(x, (p - 1n) / 2n, p);
+        const legQ = modPow(x, (q - 1n) / 2n, q);
+
+        if (legP === p - 1n && legQ === q - 1n) {
+          return x;
+        }
+      }
+    }
+
+    async function generateParams() {
+      logStatus("One-time setup: generating 1024-bit GM primes. This may take a few seconds...");
+      await tick();
+
+      let p, q;
+
+      while (true) {
+        p = getLargePrime(PRIME_BITS);
+        q = getLargePrime(PRIME_BITS);
+
+        if (p !== q) {
+          break;
+        }
+      }
+
+      const N = p * q;
+      const x = findQNR(p, q, N);
+
+      // Used for FO implicit rejection.
+      // In a real implementation this should be part of Alice's private key.
+      const sigmaSecret = crypto.getRandomValues(new Uint8Array(SEED_BYTES));
+
+      // Precompute value used for branchless selection of x versus 1.
+      const xSelect = 1n ^ x;
+
+      logStatus("GM parameters generated. Future exchanges reuse the same key.");
+      await tick();
+
+      return {
+        p,
+        q,
+        N,
+        x,
+        xSelect,
+        sigmaSecret
+      };
+    }
+
+    function getParams() {
+      if (!paramsPromise) {
+        paramsPromise = generateParams();
+      }
+      return paramsPromise;
+    }
+
+    // ============================================================
+    // BULK DETERMINISTIC COIN DERIVATION
+    //
+    // This is the major speed optimization.
+    //
+    // Instead of doing one HKDF call per GM bit, we derive an
+    // AES-CTR keystream from the seed and parse it into all coins.
+    //
+    // This is deterministic for Bob and Alice.
+    // ============================================================
+
+    async function aesCtrStream(seedBytes, length) {
+      const salt = enc.encode("GM-FO-PRG-Salt-v1");
+
+      const ikm = await crypto.subtle.importKey(
+        "raw",
+        seedBytes,
+        "HKDF",
+        false,
+        ["deriveKey", "deriveBits"]
+      );
+
+      const aesKey = await crypto.subtle.deriveKey(
+        {
+          name: "HKDF",
+          hash: "SHA-256",
+          salt: salt,
+          info: enc.encode("GM-FO-PRG-Key-v1")
+        },
+        ikm,
+        {
+          name: "AES-CTR",
+          length: 256
+        },
+        false,
+        ["encrypt"]
+      );
+
+      const counterBuf = await crypto.subtle.deriveBits(
+        {
+          name: "HKDF",
+          hash: "SHA-256",
+          salt: salt,
+          info: enc.encode("GM-FO-PRG-Counter-v1")
+        },
+        ikm,
+        16 * 8
+      );
+
+      const counter = new Uint8Array(counterBuf);
+      const zeros = new Uint8Array(length);
+
+      const keystream = await crypto.subtle.encrypt(
+        {
+          name: "AES-CTR",
+          counter: counter,
+          length: 64
+        },
+        aesKey,
+        zeros
+      );
+
+      return new Uint8Array(keystream);
+    }
+
+    async function deriveDeterministicCoinFallback(seedBytes, index, N) {
+      const byteLen = Math.ceil(N.toString(2).length / 8) + 8;
+      const salt = new Uint8Array(32);
+      const info = enc.encode("GM-FO-Coin-Gen-v1");
+
+      for (let attempt = 0; attempt < 16; attempt++) {
+        const payload = new Uint8Array(seedBytes.length + 8);
+        payload.set(seedBytes, 0);
+
+        const view = new DataView(payload.buffer);
+        view.setUint32(seedBytes.length, index, false);
+        view.setUint32(seedBytes.length + 4, attempt, false);
+
+        const key = await crypto.subtle.importKey(
+          "raw",
+          payload,
+          "HKDF",
+          false,
+          ["deriveBits"]
+        );
+
+        const bits = await crypto.subtle.deriveBits(
+          {
+            name: "HKDF",
+            hash: "SHA-256",
+            salt: salt,
+            info: info
+          },
+          key,
+          byteLen * 8
+        );
+
+        const bytes = new Uint8Array(bits);
+        const r = bytesToBigIntBE(bytes, 0, byteLen) % N;
+
+        if (r > 1n && gcd(r, N) === 1n) {
+          return r;
+        }
+      }
+
+      throw new Error("Deterministic coin fallback failed");
+    }
+
+    async function deriveCoins(seedBytes, numCoins, N) {
+      const byteLen = Math.ceil(N.toString(2).length / 8) + 8;
+
+      // Invalid coins are astronomically unlikely, but we allocate a few extras.
+      const safetyCoins = numCoins + 8;
+      const totalBytes = safetyCoins * byteLen;
+
+      try {
+        const stream = await aesCtrStream(seedBytes, totalBytes);
+        const coins = [];
+        let offset = 0;
+
+        while (coins.length < numCoins && offset + byteLen <= stream.length) {
+          let r = bytesToBigIntBE(stream, offset, byteLen) % N;
+          offset += byteLen;
+
+          if (r > 1n && gcd(r, N) === 1n) {
+            coins.push(r);
+          }
+        }
+
+        if (coins.length === numCoins) {
+          return coins;
+        }
+      } catch (e) {
+        // AES-CTR may be unavailable in some environments.
+        // Fall back to slower per-index HKDF derivation.
+      }
+
+      const coins = [];
+
+      for (let i = 0; i < numCoins; i++) {
+        coins.push(await deriveDeterministicCoinFallback(seedBytes, i, N));
+      }
+
+      return coins;
+    }
+
+    // ============================================================
+    // SESSION KEY DERIVATION
+    //
+    // For a production implementation, bind this hash to a canonical
+    // encoding of the full ciphertext vector.
+    //
+    // This demo binds to the seed plus first/last ciphertext to avoid
+    // serializing 64 KB of BigInts in the UI path.
+    // ============================================================
+
+    async function deriveFinalSessionKey(seedBytes, ciphertexts) {
+      const seedHash = await crypto.subtle.digest("SHA-256", seedBytes);
+
+      const first = ciphertexts[0].toString(16);
+      const last = ciphertexts[ciphertexts.length - 1].toString(16);
+
+      const transcript = enc.encode(
+        ciphertexts.length + "|" + first + "|" + last
+      );
+
+      const transcriptHash = await crypto.subtle.digest("SHA-256", transcript);
+
+      const combined = new Uint8Array(seedHash.byteLength + transcriptHash.byteLength);
+      combined.set(new Uint8Array(seedHash), 0);
+      combined.set(new Uint8Array(transcriptHash), seedHash.byteLength);
+
+      const finalHash = await crypto.subtle.digest("SHA-256", combined);
+
+      return bytesToHex(new Uint8Array(finalHash));
+    }
+
+    // ============================================================
+    // GM ENCRYPTION / DECRYPTION
+    // ============================================================
+
+    function encryptBitsWithCoins(seedBytes, coins, N, xSelect) {
+      const numBits = seedBytes.length * 8;
+      const ciphertexts = new Array(numBits);
+
+      for (let i = 0; i < numBits; i++) {
+        const byteIdx = Math.floor(i / 8);
+        const bitIdx = 7 - (i % 8);
+        const bit = (seedBytes[byteIdx] >> bitIdx) & 1;
+
+        const r = coins[i];
+        const r2 = (r * r) % N;
+
+        // Branchless selection:
+        // bit = 0 -> x_b = 1
+        // bit = 1 -> x_b = x
+        const mask = -BigInt(bit);
+        const x_b = 1n ^ (xSelect & mask);
+
+        ciphertexts[i] = (r2 * x_b) % N;
+      }
+
+      return ciphertexts;
+    }
+
+    function decryptCiphertexts(ciphertexts, p) {
+      const numBits = ciphertexts.length;
+      const seed = new Uint8Array(numBits / 8);
+      const exponent = (p - 1n) / 2n;
+
+      for (let i = 0; i < numBits; i++) {
+        const legP = modPow(ciphertexts[i], exponent, p);
+
+        // For valid GM ciphertexts:
+        // legP == 1      => bit 0
+        // legP == p - 1  => bit 1
+        //
+        // If invalid, this will usually produce a wrong seed,
+        // causing FO re-encryption to fail.
+        const bit = Number(legP !== 1n);
+
+        const byteIdx = Math.floor(i / 8);
+        const bitIdx = 7 - (i % 8);
+
+        seed[byteIdx] |= bit << bitIdx;
+      }
+
+      return seed;
+    }
+
+    function reencryptAndVerify(K_prime, coins, ciphertexts, N, xSelect) {
+      const numBits = ciphertexts.length;
+      let validBits = 0n;
+
+      for (let i = 0; i < numBits; i++) {
+        const byteIdx = Math.floor(i / 8);
+        const bitIdx = 7 - (i % 8);
+        const bit = (K_prime[byteIdx] >> bitIdx) & 1;
+
+        const r = coins[i];
+        const r2 = (r * r) % N;
+
+        const mask = -BigInt(bit);
+        const x_b = 1n ^ (xSelect & mask);
+
+        const cRe = (r2 * x_b) % N;
+
+        // Constant-time accumulation:
+        // no early break, no decryption oracle.
+        validBits += BigInt(cRe === ciphertexts[i]);
+      }
+
+      return validBits === BigInt(numBits);
+    }
+
+    // ============================================================
+    // MAIN DEMO
+    // ============================================================
+
+    async function runKemDemo(shouldTamper) {
+      if (busy) return;
+      busy = true;
+
+      try {
+        document.getElementById("output").innerHTML = "";
+
+        const params = await getParams();
+        const {
+          p,
+          N,
+          xSelect,
+          sigmaSecret
+        } = params;
+
+        logStatus("Bob is encapsulating a 256-bit seed...");
+
+        const K_seed = crypto.getRandomValues(new Uint8Array(SEED_BYTES));
+        const numBits = SEED_BYTES * 8;
+
+        const bobCoins = await deriveCoins(K_seed, numBits, N);
+        const ciphertexts = encryptBitsWithCoins(K_seed, bobCoins, N, xSelect);
+
+        const bobSessionKey = await deriveFinalSessionKey(K_seed, ciphertexts);
+
+        if (shouldTamper) {
+          logStatus("Active attack: multiplying ciphertext[0] by 4...");
+          ciphertexts[0] = (ciphertexts[0] * 4n) % N;
+        } else {
+          logStatus("Alice is decapsulating...");
+        }
+
+        const K_prime = decryptCiphertexts(ciphertexts, p);
+
+        logStatus("Alice is re-deriving FO coins and verifying ciphertexts...");
+
+        const aliceCoins = await deriveCoins(K_prime, numBits, N);
+        const isValid = reencryptAndVerify(K_prime, aliceCoins, ciphertexts, N, xSelect);
+
+        let aliceSessionKey;
+
+        if (isValid) {
+          aliceSessionKey = await deriveFinalSessionKey(K_prime, ciphertexts);
+        } else {
+          // FO implicit rejection.
+          aliceSessionKey = await deriveFinalSessionKey(sigmaSecret, ciphertexts);
+        }
+
+        const keysMatch = bobSessionKey === aliceSessionKey;
+
+        logStatus(
+          `Done. FO verification: ${isValid ? "PASSED" : "FAILED"}. ` +
+          `Key match: ${keysMatch}.`
+        );
+
+        document.getElementById("output").innerHTML = `
+          <div class="box">
+            <div class="label">1. Optimizations Applied</div>
+            <div>GM public key: <span class="value">Generated once and cached</span></div>
+            <div>Coin derivation: <span class="value">Bulk AES-CTR stream instead of per-bit HKDF</span></div>
+            <div>FO verification: <span class="value">Constant-time accumulator, no early break</span></div>
+            <div>GM plaintext selection: <span class="value">Branchless BigInt mask</span></div>
+          </div>
+
+          <div class="box">
+            <div class="label">2. Bob's Encapsulation</div>
+            <div>Seed K: <span class="value">0x${bytesToHex(K_seed)}</span></div>
+            <div>Bob session key: <span class="value">${bobSessionKey}</span></div>
+          </div>
+
+          <div class="box">
+            <div class="label">3. FO Verification</div>
+            <div>Tampering attack: <b>${shouldTamper ? "YES" : "NO"}</b></div>
+            <div>
+              FO re-encryption check:
+              <span class="${isValid ? "success" : "error"}">
+                ${isValid ? "PASSED" : "FAILED"}
+              </span>
+            </div>
+          </div>
+
+          <div class="box" style="border-color: ${keysMatch ? "#4ec9b0" : "#f14c4c"};">
+            <div class="label">4. Decapsulation Result</div>
+            <div>Alice session key: <span class="value">${aliceSessionKey}</span></div>
+            <div>
+              Session key match:
+              <span class="${keysMatch ? "success" : "error"}">${keysMatch}</span>
+            </div>
+            <p style="margin-top: 10px;" class="${keysMatch ? "success" : "error"}">
+              ${
+                isValid
+                  ? "✓ Honest exchange successful."
+                  : "✓ Implicit rejection triggered. Alice produced a pseudorandom fallback key instead of leaking an error."
+              }
+            </p>
+          </div>
+        `;
+      } catch (err) {
+        logStatus("Error: " + err.message);
+        console.error(err);
+      } finally {
+        busy = false;
+      }
+    }
+  </script>
+</body>
+</html>
